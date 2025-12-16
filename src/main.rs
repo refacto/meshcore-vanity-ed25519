@@ -2,11 +2,10 @@ use clap::Parser;
 use colored::*;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use indicatif::{ProgressBar, ProgressStyle};
+use rand::SeedableRng;
 use rand::rngs::StdRng;
-use rand::{RngCore, SeedableRng};
 use rayon::prelude::*;
 use serde::Serialize;
-use sha2::{Digest, Sha512};
 use std::fs;
 use std::io::Error;
 use std::sync::Arc;
@@ -32,6 +31,11 @@ struct Args {
     /// Silent execution (suppress progress bar and logs)
     #[arg(short = 'q', long, default_value_t = false)]
     quiet: bool,
+}
+
+struct PrefixTarget {
+    bytes: Vec<u8>,
+    remainder_nibble: Option<u8>,
 }
 
 fn is_prefix_valid(prefix: &str) -> bool {
@@ -75,8 +79,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (found, attempts) = initialize_shared_state();
 
-    // Prepare nibbles for fast comparison
-    let target_nibbles = hex_string_to_nibbles(&prefix);
+    // Prepare optimized target for fast comparison
+    let target = parse_prefix_target(&prefix);
 
     // Only set up progress bar if not in quiet mode
     let pb = if !quiet {
@@ -93,7 +97,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         estimated_attempts,
     );
 
-    let result = perform_parallel_search(&target_nibbles, &attempts, &found);
+    let result = perform_parallel_search(&target, &attempts, &found);
 
     found.store(true, Ordering::Relaxed);
     monitor_handle.join().unwrap();
@@ -169,7 +173,7 @@ fn setup_progress_bar(len: u64) -> ProgressBar {
                 "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) | {per_sec} | ETA: {eta}"
             )
             .unwrap()
-            .progress_chars("#>-"),
+            .progress_chars("#>- ")
     );
     // indicatif defaults to stderr, which is what we want
     pb
@@ -217,23 +221,38 @@ fn spawn_progress_monitor(
     })
 }
 
-// Convert hex string to nibbles (0-15)
-fn hex_string_to_nibbles(hex: &str) -> Vec<u8> {
-    hex.chars().map(|c| c.to_digit(16).unwrap() as u8).collect()
+// Optimized parsing: Convert hex string to full bytes and optional remainder nibble
+fn parse_prefix_target(hex: &str) -> PrefixTarget {
+    let nibbles: Vec<u8> = hex.chars().map(|c| c.to_digit(16).unwrap() as u8).collect();
+
+    let chunks = nibbles.chunks_exact(2);
+    let remainder = chunks.remainder();
+
+    let bytes: Vec<u8> = chunks.map(|chunk| (chunk[0] << 4) | chunk[1]).collect();
+
+    let remainder_nibble = if remainder.is_empty() {
+        None
+    } else {
+        Some(remainder[0])
+    };
+
+    PrefixTarget {
+        bytes,
+        remainder_nibble,
+    }
 }
 
 struct KeyResult {
     #[allow(dead_code)]
-    // Used in original logic logic but maybe not all fields needed for output directly, keeping for consistency
     signing_key: SigningKey,
     #[allow(dead_code)]
     verifying_key: VerifyingKey,
     public_key_hex: String,
-    rfc8032_private_key: [u8; 64],
+    private_key_hex: String, // Storing hex directly now
 }
 
 fn perform_parallel_search(
-    target_nibbles: &[u8],
+    target: &PrefixTarget,
     attempts: &Arc<AtomicU64>,
     found: &Arc<AtomicBool>,
 ) -> Option<KeyResult> {
@@ -248,18 +267,29 @@ fn perform_parallel_search(
                 return None;
             }
 
-            let (signing_key, verifying_key, rfc8032_private_key) = generate_ed25519_key(&mut rng);
+            // Correct generation using library standard
+            let signing_key = SigningKey::generate(&mut rng);
+            let verifying_key = signing_key.verifying_key();
 
-            // Fast prefix check using nibbles
+            // Fast prefix check
             let key_bytes = verifying_key.as_bytes();
             let mut matches = true;
-            for (i, &nibble) in target_nibbles.iter().enumerate() {
-                let byte = key_bytes[i / 2];
-                let key_nibble = if i % 2 == 0 { byte >> 4 } else { byte & 0x0F };
 
-                if key_nibble != nibble {
+            // 1. Check full bytes
+            for (i, &byte) in target.bytes.iter().enumerate() {
+                if key_bytes[i] != byte {
                     matches = false;
                     break;
+                }
+            }
+
+            // 2. Check remainder nibble if present
+            if matches {
+                if let Some(nibble) = target.remainder_nibble {
+                    let next_byte_idx = target.bytes.len();
+                    if (key_bytes[next_byte_idx] >> 4) != nibble {
+                        matches = false;
+                    }
                 }
             }
 
@@ -268,49 +298,20 @@ fn perform_parallel_search(
 
             if matches {
                 local_found.store(true, Ordering::Relaxed);
+
                 let public_key_hex = hex::encode(key_bytes);
+                // Private key is the 32-byte seed
+                let private_key_hex = hex::encode(signing_key.to_bytes());
+
                 return Some(KeyResult {
                     signing_key,
                     verifying_key,
                     public_key_hex,
-                    rfc8032_private_key,
+                    private_key_hex,
                 });
             }
         }
     })
-}
-
-#[inline(always)]
-fn generate_ed25519_key<R: RngCore>(rng: &mut R) -> (SigningKey, VerifyingKey, [u8; 64]) {
-    // RFC 8032 Ed25519 key generation
-
-    // 1. Generate 32-byte random seed
-    let mut seed = [0u8; 32];
-    rng.fill_bytes(&mut seed);
-
-    // 2. Hash the seed with SHA-512 to get 64 bytes
-    let mut hasher = Sha512::new();
-    hasher.update(seed);
-    let digest = hasher.finalize();
-
-    // 3. Clamp the first 32 bytes
-    let mut clamped = [0u8; 32];
-    clamped.copy_from_slice(&digest[..32]);
-    clamped[0] &= 248;
-    clamped[31] &= 63;
-    clamped[31] |= 64;
-
-    // 4. Create the signing key
-    let signing_key = SigningKey::from_bytes(&clamped);
-    let verifying_key = signing_key.verifying_key();
-    // String allocation removed from here
-
-    // 5. Create 64-byte RFC 8032 private key
-    let mut rfc8032_private_key = [0u8; 64];
-    rfc8032_private_key[..32].copy_from_slice(&clamped);
-    rfc8032_private_key[32..].copy_from_slice(&digest[32..]);
-
-    (signing_key, verifying_key, rfc8032_private_key)
 }
 
 fn handle_success(
@@ -320,12 +321,10 @@ fn handle_success(
     total_attempts: u64,
     elapsed: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let private_key_hex = hex::encode(result.rfc8032_private_key);
-
     if args.json {
         let keypair = MeshCoreKeypair {
             public_key: result.public_key_hex.to_uppercase(),
-            private_key: private_key_hex.to_uppercase(),
+            private_key: result.private_key_hex.to_uppercase(),
         };
         let json_output = serde_json::to_string_pretty(&keypair)?;
         // JSON output always to stdout
@@ -339,8 +338,8 @@ fn handle_success(
         println!("{}:", "Public Key".cyan().bold());
         println!("{}", result.public_key_hex.to_uppercase().white());
 
-        println!("\n{}:", "Private Key".cyan().bold());
-        println!("{}", private_key_hex.to_uppercase().white());
+        println!("\n{}:", "Private Key (Seed)".cyan().bold());
+        println!("{}", result.private_key_hex.to_uppercase().white());
         println!(
             "{}",
             "=============================================".bright_black()
@@ -350,7 +349,6 @@ fn handle_success(
     // Print Stats and Validation to stderr, unless quiet
     if !args.quiet {
         eprintln!("\n{}", "✓ Key Generated Successfully!".bold().green());
-        // Removed the extra horizontal line here to avoid double lines in human output
 
         eprintln!("\n{}", "Validation Status:".yellow().bold());
         eprintln!(
@@ -378,7 +376,7 @@ fn handle_success(
         match save_keypair_json(
             output_filename,
             &result.public_key_hex.to_uppercase(),
-            &private_key_hex.to_uppercase(),
+            &result.private_key_hex.to_uppercase(),
         ) {
             Ok(_) => {
                 if !args.quiet {
