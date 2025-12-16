@@ -10,6 +10,7 @@ use std::fs;
 use std::io::Error;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 #[derive(Parser, Debug)]
@@ -35,66 +36,112 @@ fn is_prefix_valid(prefix: &str) -> bool {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    let prefix = normalize_prefix(&args);
 
-    // Normalize the prefix
-    let prefix = if args.case_sensitive {
-        args.prefix.clone()
-    } else {
-        args.prefix.to_lowercase()
-    };
-
-    if !is_prefix_valid(&prefix) {
-        println!("❌ Prefix must contain only hexadecimal characters (0-9, a-f)");
-        return Err(format!("Invalid prefix: {}", prefix).into());
-    }
+    validate_prefix(&prefix)?;
 
     println!("🔍 Searching for Ed25519 key with prefix: {}", prefix);
     println!("🖥️  Using {} CPU cores", num_cpus::get());
 
-    // Calculate estimated attempts needed
-    let prefix_len = prefix.len();
-    let estimated_attempts = 16_u64.pow(prefix_len as u32);
-
+    let estimated_attempts = calculate_estimated_attempts(prefix.len());
     println!(
         "📊 Estimated attempts needed: ~{}",
         format_number(estimated_attempts)
     );
     println!("⏱️  Starting search...\n");
 
-    // Shared atomic counter and flag
-    let attempts = Arc::new(AtomicU64::new(0));
-    let found = Arc::new(AtomicBool::new(false));
+    let (found, attempts) = initialize_shared_state();
+    let pb = setup_progress_bar(estimated_attempts);
 
-    // Progress bar setup
-    let pb = ProgressBar::new(estimated_attempts);
+    let start_time = Instant::now();
+    let monitor_handle = spawn_progress_monitor(
+        pb.clone(),
+        attempts.clone(),
+        found.clone(),
+        estimated_attempts,
+    );
+
+    let result = perform_parallel_search(&args, &prefix, &attempts, &found);
+
+    found.store(true, Ordering::Relaxed);
+    monitor_handle.join().unwrap();
+    pb.finish();
+
+    let elapsed = start_time.elapsed();
+    let total_attempts = attempts.load(Ordering::Relaxed);
+
+    match result {
+        Some(key_result) => handle_success(key_result, &args, &prefix, total_attempts, elapsed),
+        None => {
+            println!("\n❌ Search was interrupted");
+            Err("Search interrupted".into())
+        }
+    }
+}
+
+// --- Helper Functions ---
+
+fn normalize_prefix(args: &Args) -> String {
+    if args.case_sensitive {
+        args.prefix.clone()
+    } else {
+        args.prefix.to_lowercase()
+    }
+}
+
+fn validate_prefix(prefix: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if !is_prefix_valid(prefix) {
+        println!("❌ Prefix must contain only hexadecimal characters (0-9, a-f)");
+        return Err(format!("Invalid prefix: {}", prefix).into());
+    }
+    Ok(())
+}
+
+fn calculate_estimated_attempts(prefix_len: usize) -> u64 {
+    16_u64.pow(prefix_len as u32)
+}
+
+fn initialize_shared_state() -> (Arc<AtomicBool>, Arc<AtomicU64>) {
+    (
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicU64::new(0)),
+    )
+}
+
+fn setup_progress_bar(len: u64) -> ProgressBar {
+    let pb = ProgressBar::new(len);
     pb.set_style(
         ProgressStyle::default_bar()
-            .template("[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) | {per_sec} | ETA: {eta}")
+            .template(
+                "[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) | {per_sec} | ETA: {eta}"
+            )
             .unwrap()
             .progress_chars("#>-"),
     );
+    pb
+}
 
-    let start_time = Instant::now();
-    let pb_clone = pb.clone();
-    let attempts_clone = attempts.clone();
-    let found_clone = found.clone();
-
-    // Spawn a thread to update the progress bar
-    let update_thread = std::thread::spawn(move || {
+fn spawn_progress_monitor(
+    pb: ProgressBar,
+    attempts: Arc<AtomicU64>,
+    found: Arc<AtomicBool>,
+    initial_estimate: u64,
+) -> JoinHandle<()> {
+    std::thread::spawn(move || {
         let mut last_update_time = Instant::now();
         let mut last_attempts = 0u64;
-        let mut current_total = estimated_attempts;
+        let mut current_total = initial_estimate;
 
-        while !found_clone.load(Ordering::Relaxed) {
-            let current = attempts_clone.load(Ordering::Relaxed);
+        while !found.load(Ordering::Relaxed) {
+            let current = attempts.load(Ordering::Relaxed);
 
             // Update total if we exceed initial estimate
             if current > current_total {
                 current_total = current + (current / 10); // Add 10% buffer
-                pb_clone.set_length(current_total);
+                pb.set_length(current_total);
             }
 
-            pb_clone.set_position(current);
+            pb.set_position(current);
 
             // Recalculate ETA every second based on actual rate
             if last_update_time.elapsed() >= Duration::from_secs(1) {
@@ -103,7 +150,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if rate > 0.0 && current < current_total {
                     let remaining = current_total - current;
                     let eta_secs = (remaining as f64 / rate) as u64;
-                    pb_clone.set_message(format!("~{}s remaining", eta_secs));
+                    pb.set_message(format!("~{}s remaining", eta_secs));
                 }
                 last_attempts = current;
                 last_update_time = Instant::now();
@@ -111,129 +158,150 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             std::thread::sleep(Duration::from_millis(100));
         }
-    });
+    })
+}
 
-    // Parallel search across all CPU cores
-    let result: Option<(SigningKey, VerifyingKey, String, [u8; 64])> =
-        (0..num_cpus::get()).into_par_iter().find_map_any(|_| {
-            let mut rng = OsRng;
-            let local_attempts = Arc::clone(&attempts);
-            let local_found = Arc::clone(&found);
+struct KeyResult {
+    #[allow(dead_code)]
+    // Used in original logic logic but maybe not all fields needed for output directly, keeping for consistency
+    signing_key: SigningKey,
+    #[allow(dead_code)]
+    verifying_key: VerifyingKey,
+    public_key_hex: String,
+    rfc8032_private_key: [u8; 64],
+}
 
-            loop {
-                if local_found.load(Ordering::Relaxed) {
-                    return None;
-                }
+fn perform_parallel_search(
+    args: &Args,
+    prefix: &str,
+    attempts: &Arc<AtomicU64>,
+    found: &Arc<AtomicBool>,
+) -> Option<KeyResult> {
+    (0..num_cpus::get()).into_par_iter().find_map_any(|_| {
+        let mut rng = OsRng;
+        let local_attempts = Arc::clone(attempts);
+        let local_found = Arc::clone(found);
 
-                // RFC 8032 Ed25519 key generation:
-                // SHA-512 is used because RFC 8032 specifies it as part of the standard Ed25519 key derivation.
-                // Why SHA-512?
-                // - The first 32 bytes become the clamped scalar (secret key for signing)
-                // - The second 32 bytes are used as a nonce/randomness source during signing
-                // - This ensures deterministic signatures while maintaining security
-                // - MeshCore follows this standard format for compatibility
-
-                // 1. Generate 32-byte random seed
-                let mut seed = [0u8; 32];
-                rng.fill_bytes(&mut seed);
-
-                // 2. Hash the seed with SHA-512 to get 64 bytes
-                let mut hasher = Sha512::new();
-                hasher.update(seed);
-                let digest = hasher.finalize();
-
-                // 3. Clamp the first 32 bytes (scalar clamping)
-                let mut clamped = [0u8; 32];
-                clamped.copy_from_slice(&digest[..32]);
-                clamped[0] &= 248; // Clear bottom 3 bits
-                clamped[31] &= 63; // Clear top 2 bits
-                clamped[31] |= 64; // Set bit 6
-
-                // 4. Create the signing key from the clamped scalar
-                let signing_key = SigningKey::from_bytes(&clamped);
-                let verifying_key = signing_key.verifying_key();
-                let public_key_hex = hex::encode(verifying_key.as_bytes());
-
-                // 5. Create 64-byte RFC 8032 private key: [clamped_scalar][sha512_second_half]
-                let mut rfc8032_private_key = [0u8; 64];
-                rfc8032_private_key[..32].copy_from_slice(&clamped);
-                rfc8032_private_key[32..].copy_from_slice(&digest[32..]);
-
-                // Check if it matches the prefix
-                let matches = if args.case_sensitive {
-                    public_key_hex.starts_with(&prefix)
-                } else {
-                    public_key_hex.to_lowercase().starts_with(&prefix)
-                };
-
-                // Increment counter
-                local_attempts.fetch_add(1, Ordering::Relaxed);
-
-                if matches {
-                    local_found.store(true, Ordering::Relaxed);
-                    return Some((
-                        signing_key,
-                        verifying_key,
-                        public_key_hex,
-                        rfc8032_private_key,
-                    ));
-                }
+        loop {
+            if local_found.load(Ordering::Relaxed) {
+                return None;
             }
-        });
 
-    found.store(true, Ordering::Relaxed);
-    update_thread.join().unwrap();
-    pb.finish();
+            let (signing_key, verifying_key, public_key_hex, rfc8032_private_key) =
+                generate_ed25519_key(&mut rng);
 
-    let elapsed = start_time.elapsed();
-    let total_attempts = attempts.load(Ordering::Relaxed);
+            // Check if it matches the prefix
+            let matches = if args.case_sensitive {
+                public_key_hex.starts_with(prefix)
+            } else {
+                public_key_hex.to_lowercase().starts_with(prefix)
+            };
 
-    match result {
-        Some((_signing_key, _verifying_key, public_key_hex, rfc8032_private_key)) => {
-            let private_key_hex = hex::encode(rfc8032_private_key);
+            // Increment counter
+            local_attempts.fetch_add(1, Ordering::Relaxed);
 
-            println!("\n✓ Key Generated Successfully!");
-            println!("Public Key:");
-            println!("{}", public_key_hex.to_uppercase());
-            println!("Private Key:");
-            println!("{}", private_key_hex.to_uppercase());
-            println!("Validation Status:");
-            println!(
-                "✓ RFC 8032 Ed25519 compliant - Proper SHA-512 expansion, scalar clamping, and key consistency verified"
-            );
-            println!("{}", format_number(total_attempts));
-            println!("Attempts");
-            println!("{:.1}s", elapsed.as_secs_f64());
-            println!("Time");
-            println!(
-                "{}",
-                format_number((total_attempts as f64 / elapsed.as_secs_f64()) as u64)
-            );
-            println!("Keys/sec");
-
-            // Save to file
-            let output_filename = args
-                .output
-                .unwrap_or_else(|| format!("meshcore_{}.json", prefix));
-
-            match save_keypair_json(
-                &output_filename,
-                &public_key_hex.to_uppercase(),
-                &private_key_hex.to_uppercase(),
-            ) {
-                Ok(_) => println!("\n💾 Key pair saved to: {}", output_filename),
-                Err(e) => {
-                    eprintln!("\n⚠️  Failed to save key pair: {}", e);
-                    return Err("Failed to save key pair".into());
-                }
+            if matches {
+                local_found.store(true, Ordering::Relaxed);
+                return Some(KeyResult {
+                    signing_key,
+                    verifying_key,
+                    public_key_hex,
+                    rfc8032_private_key,
+                });
             }
         }
-        None => {
-            println!("\n❌ Search was interrupted");
-            return Err("Search interrupted".into());
+    })
+}
+
+#[inline(always)]
+fn generate_ed25519_key(rng: &mut OsRng) -> (SigningKey, VerifyingKey, String, [u8; 64]) {
+    // RFC 8032 Ed25519 key generation:
+    // SHA-512 is used because RFC 8032 specifies it as part of the standard Ed25519 key derivation.
+    // Why SHA-512?
+    // - The first 32 bytes become the clamped scalar (secret key for signing)
+    // - The second 32 bytes are used as a nonce/randomness source during signing
+    // - This ensures deterministic signatures while maintaining security
+    // - MeshCore follows this standard format for compatibility
+
+    // 1. Generate 32-byte random seed
+    let mut seed = [0u8; 32];
+    rng.fill_bytes(&mut seed);
+
+    // 2. Hash the seed with SHA-512 to get 64 bytes
+    let mut hasher = Sha512::new();
+    hasher.update(seed);
+    let digest = hasher.finalize();
+
+    // 3. Clamp the first 32 bytes (scalar clamping)
+    let mut clamped = [0u8; 32];
+    clamped.copy_from_slice(&digest[..32]);
+    clamped[0] &= 248; // Clear bottom 3 bits
+    clamped[31] &= 63; // Clear top 2 bits
+    clamped[31] |= 64; // Set bit 6
+
+    // 4. Create the signing key from the clamped scalar
+    let signing_key = SigningKey::from_bytes(&clamped);
+    let verifying_key = signing_key.verifying_key();
+    let public_key_hex = hex::encode(verifying_key.as_bytes());
+
+    // 5. Create 64-byte RFC 8032 private key: [clamped_scalar][sha512_second_half]
+    let mut rfc8032_private_key = [0u8; 64];
+    rfc8032_private_key[..32].copy_from_slice(&clamped);
+    rfc8032_private_key[32..].copy_from_slice(&digest[32..]);
+
+    (
+        signing_key,
+        verifying_key,
+        public_key_hex,
+        rfc8032_private_key,
+    )
+}
+
+fn handle_success(
+    result: KeyResult,
+    args: &Args,
+    prefix: &str,
+    total_attempts: u64,
+    elapsed: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let private_key_hex = hex::encode(result.rfc8032_private_key);
+
+    println!("\n✓ Key Generated Successfully!");
+    println!("Public Key:");
+    println!("{}", result.public_key_hex.to_uppercase());
+    println!("Private Key:");
+    println!("{}", private_key_hex.to_uppercase());
+    println!("Validation Status:");
+    println!(
+        "✓ RFC 8032 Ed25519 compliant - Proper SHA-512 expansion, scalar clamping, and key consistency verified"
+    );
+    println!("{}", format_number(total_attempts));
+    println!("Attempts");
+    println!("{:.1}s", elapsed.as_secs_f64());
+    println!("Time");
+    println!(
+        "{}",
+        format_number((total_attempts as f64 / elapsed.as_secs_f64()) as u64)
+    );
+    println!("Keys/sec");
+
+    // Save to file
+    let output_filename = args
+        .output
+        .clone()
+        .unwrap_or_else(|| format!("meshcore_{}.json", prefix));
+
+    match save_keypair_json(
+        &output_filename,
+        &result.public_key_hex.to_uppercase(),
+        &private_key_hex.to_uppercase(),
+    ) {
+        Ok(_) => println!("\n💾 Key pair saved to: {}", output_filename),
+        Err(e) => {
+            eprintln!("\n⚠️  Failed to save key pair: {}", e);
+            return Err("Failed to save key pair".into());
         }
     }
-
     Ok(())
 }
 
@@ -275,3 +343,4 @@ mod num_cpus {
             .unwrap_or(1)
     }
 }
+
