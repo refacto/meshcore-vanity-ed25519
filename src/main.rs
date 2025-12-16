@@ -21,7 +21,7 @@ struct Args {
     #[arg(short, long)]
     prefix: String,
 
-    /// Case sensitive search
+    /// Case sensitive search (Note: Ed25519 hex is typically lowercase, this might restrict results)
     #[arg(short = 's', long, default_value_t = false)]
     case_sensitive: bool,
 
@@ -45,6 +45,7 @@ fn is_prefix_valid(prefix: &str) -> bool {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    // We keep the prefix normalization for display/logic, but we'll use nibbles for searching
     let prefix = normalize_prefix(&args);
 
     validate_prefix(&prefix)?;
@@ -66,7 +67,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let estimated_attempts = calculate_estimated_attempts(prefix.len());
-    
+
     if !quiet {
         println!(
             "{} {}",
@@ -78,6 +79,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (found, attempts) = initialize_shared_state();
     
+    // Prepare nibbles for fast comparison
+    let target_nibbles = hex_string_to_nibbles(&prefix);
+
     // Only set up progress bar if not in quiet mode
     let pb = if !quiet {
         Some(setup_progress_bar(estimated_attempts))
@@ -93,11 +97,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         estimated_attempts,
     );
 
-    let result = perform_parallel_search(&args, &prefix, &attempts, &found);
+    let result = perform_parallel_search(&target_nibbles, &attempts, &found);
 
     found.store(true, Ordering::Relaxed);
     monitor_handle.join().unwrap();
-    
+
     if let Some(bar) = pb {
         bar.finish_and_clear();
     }
@@ -206,6 +210,13 @@ fn spawn_progress_monitor(
     })
 }
 
+// Convert hex string to nibbles (0-15)
+fn hex_string_to_nibbles(hex: &str) -> Vec<u8> {
+    hex.chars()
+        .map(|c| c.to_digit(16).unwrap() as u8)
+        .collect()
+}
+
 struct KeyResult {
     #[allow(dead_code)] // Used in original logic logic but maybe not all fields needed for output directly, keeping for consistency
     signing_key: SigningKey,
@@ -216,8 +227,7 @@ struct KeyResult {
 }
 
 fn perform_parallel_search(
-    args: &Args,
-    prefix: &str,
+    target_nibbles: &[u8],
     attempts: &Arc<AtomicU64>,
     found: &Arc<AtomicBool>,
 ) -> Option<KeyResult> {
@@ -231,21 +241,32 @@ fn perform_parallel_search(
                 return None;
             }
 
-            let (signing_key, verifying_key, public_key_hex, rfc8032_private_key) =
+            let (signing_key, verifying_key, rfc8032_private_key) =
                 generate_ed25519_key(&mut rng);
 
-            // Check if it matches the prefix
-            let matches = if args.case_sensitive {
-                public_key_hex.starts_with(prefix)
-            } else {
-                public_key_hex.to_lowercase().starts_with(prefix)
-            };
+            // Fast prefix check using nibbles
+            let key_bytes = verifying_key.as_bytes();
+            let mut matches = true;
+            for (i, &nibble) in target_nibbles.iter().enumerate() {
+                let byte = key_bytes[i / 2];
+                let key_nibble = if i % 2 == 0 {
+                    byte >> 4
+                } else {
+                    byte & 0x0F
+                };
+                
+                if key_nibble != nibble {
+                    matches = false;
+                    break;
+                }
+            }
 
             // Increment counter
             local_attempts.fetch_add(1, Ordering::Relaxed);
 
             if matches {
                 local_found.store(true, Ordering::Relaxed);
+                let public_key_hex = hex::encode(key_bytes);
                 return Some(KeyResult {
                     signing_key,
                     verifying_key,
@@ -258,15 +279,9 @@ fn perform_parallel_search(
 }
 
 #[inline(always)]
-fn generate_ed25519_key(rng: &mut OsRng) -> (SigningKey, VerifyingKey, String, [u8; 64]) {
-    // RFC 8032 Ed25519 key generation:
-    // SHA-512 is used because RFC 8032 specifies it as part of the standard Ed25519 key derivation.
-    // Why SHA-512?
-    // - The first 32 bytes become the clamped scalar (secret key for signing)
-    // - The second 32 bytes are used as a nonce/randomness source during signing
-    // - This ensures deterministic signatures while maintaining security
-    // - MeshCore follows this standard format for compatibility
-
+fn generate_ed25519_key(rng: &mut OsRng) -> (SigningKey, VerifyingKey, [u8; 64]) {
+    // RFC 8032 Ed25519 key generation
+    
     // 1. Generate 32-byte random seed
     let mut seed = [0u8; 32];
     rng.fill_bytes(&mut seed);
@@ -276,19 +291,19 @@ fn generate_ed25519_key(rng: &mut OsRng) -> (SigningKey, VerifyingKey, String, [
     hasher.update(seed);
     let digest = hasher.finalize();
 
-    // 3. Clamp the first 32 bytes (scalar clamping)
+    // 3. Clamp the first 32 bytes
     let mut clamped = [0u8; 32];
     clamped.copy_from_slice(&digest[..32]);
-    clamped[0] &= 248; // Clear bottom 3 bits
-    clamped[31] &= 63; // Clear top 2 bits
-    clamped[31] |= 64; // Set bit 6
+    clamped[0] &= 248; 
+    clamped[31] &= 63; 
+    clamped[31] |= 64; 
 
-    // 4. Create the signing key from the clamped scalar
+    // 4. Create the signing key
     let signing_key = SigningKey::from_bytes(&clamped);
     let verifying_key = signing_key.verifying_key();
-    let public_key_hex = hex::encode(verifying_key.as_bytes());
+    // String allocation removed from here
 
-    // 5. Create 64-byte RFC 8032 private key: [clamped_scalar][sha512_second_half]
+    // 5. Create 64-byte RFC 8032 private key
     let mut rfc8032_private_key = [0u8; 64];
     rfc8032_private_key[..32].copy_from_slice(&clamped);
     rfc8032_private_key[32..].copy_from_slice(&digest[32..]);
@@ -296,7 +311,6 @@ fn generate_ed25519_key(rng: &mut OsRng) -> (SigningKey, VerifyingKey, String, [
     (
         signing_key,
         verifying_key,
-        public_key_hex,
         rfc8032_private_key,
     )
 }
