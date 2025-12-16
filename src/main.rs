@@ -2,16 +2,16 @@ use clap::Parser;
 use colored::*;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use indicatif::{ProgressBar, ProgressStyle};
-use rand::rngs::StdRng;
 use rand::RngCore;
 use rand::SeedableRng;
+use rand::rngs::StdRng;
 use rayon::prelude::*;
 use serde::Serialize;
 use sha2::{Digest, Sha512};
 use std::fs;
 use std::io::Error;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -283,12 +283,10 @@ fn perform_parallel_search(
             }
 
             // 2. Check remainder nibble if present
-            if matches {
-                if let Some(nibble) = target.remainder_nibble {
-                    let next_byte_idx = target.bytes.len();
-                    if (key_bytes[next_byte_idx] >> 4) != nibble {
-                        matches = false;
-                    }
+            if matches && let Some(nibble) = target.remainder_nibble {
+                let next_byte_idx = target.bytes.len();
+                if (key_bytes[next_byte_idx] >> 4) != nibble {
+                    matches = false;
                 }
             }
 
@@ -477,13 +475,13 @@ mod tests {
         // Manually reconstruct the public key from the private key components
         // private_key_bytes is 64 bytes: [clamped_scalar (32)][hash_remainder (32)]
         let scalar_bytes: [u8; 32] = private_key_bytes[0..32].try_into().unwrap();
-        
-        // In Ed25519, the "private key" usually refers to the seed, 
+
+        // In Ed25519, the "private key" usually refers to the seed,
         // but here we are working with the "expanded" private key components.
         // `SigningKey::from_bytes` expects the SCALAR if it's the clamped version?
         // ed25519-dalek 2.x `SigningKey::from_bytes` expects the *Scalar*.
         // And `generate_ed25519_key` produces `clamped` which IS the scalar.
-        
+
         let re_signing_key = SigningKey::from_bytes(&scalar_bytes);
         let re_verifying_key = re_signing_key.verifying_key();
 
