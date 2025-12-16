@@ -2,16 +2,16 @@ use clap::Parser;
 use colored::*;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use indicatif::{ProgressBar, ProgressStyle};
+use rand::rngs::StdRng;
 use rand::RngCore;
 use rand::SeedableRng;
-use rand::rngs::StdRng;
 use rayon::prelude::*;
 use serde::Serialize;
 use sha2::{Digest, Sha512};
 use std::fs;
 use std::io::Error;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -462,5 +462,54 @@ mod num_cpus {
         std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_key_validity() {
+        let mut rng = StdRng::seed_from_u64(42);
+        let (_signing_key, verifying_key, private_key_bytes) = generate_ed25519_key(&mut rng);
+
+        // Manually reconstruct the public key from the private key components
+        // private_key_bytes is 64 bytes: [clamped_scalar (32)][hash_remainder (32)]
+        let scalar_bytes: [u8; 32] = private_key_bytes[0..32].try_into().unwrap();
+        
+        // In Ed25519, the "private key" usually refers to the seed, 
+        // but here we are working with the "expanded" private key components.
+        // `SigningKey::from_bytes` expects the SCALAR if it's the clamped version?
+        // ed25519-dalek 2.x `SigningKey::from_bytes` expects the *Scalar*.
+        // And `generate_ed25519_key` produces `clamped` which IS the scalar.
+        
+        let re_signing_key = SigningKey::from_bytes(&scalar_bytes);
+        let re_verifying_key = re_signing_key.verifying_key();
+
+        assert_eq!(
+            verifying_key.as_bytes(),
+            re_verifying_key.as_bytes(),
+            "Public key derived from private key components should match the generated verifying key"
+        );
+    }
+
+    #[test]
+    fn test_parse_prefix_target() {
+        // "12" -> 0x12 (18)
+        let t = parse_prefix_target("12");
+        assert_eq!(t.bytes, vec![0x12]);
+        assert_eq!(t.remainder_nibble, None);
+
+        // "123" -> 0x12, remainder 3
+        let t = parse_prefix_target("123");
+        assert_eq!(t.bytes, vec![0x12]);
+        assert_eq!(t.remainder_nibble, Some(3));
+
+        // "A" -> remainder 10
+        let t = parse_prefix_target("A");
+        let empty: Vec<u8> = vec![];
+        assert_eq!(t.bytes, empty);
+        assert_eq!(t.remainder_nibble, Some(10));
     }
 }
