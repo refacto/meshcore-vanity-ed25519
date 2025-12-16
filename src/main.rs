@@ -1,15 +1,15 @@
 use clap::Parser;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use indicatif::{ProgressBar, ProgressStyle};
-use rand::RngCore;
 use rand::rngs::OsRng;
+use rand::RngCore;
 use rayon::prelude::*;
 use serde::Serialize;
 use sha2::{Digest, Sha512};
 use std::fs;
 use std::io::Error;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -24,9 +24,17 @@ struct Args {
     #[arg(short = 's', long, default_value_t = false)]
     case_sensitive: bool,
 
-    /// Output file to save the key pair (default: keypair_<prefix>.txt)
+    /// Output file to save the key pair (optional)
     #[arg(short, long)]
     output: Option<String>,
+
+    /// Print only the JSON output to stdout
+    #[arg(long, default_value_t = false)]
+    json: bool,
+
+    /// Silent execution (suppress progress bar and logs)
+    #[arg(short = 'q', long, default_value_t = false)]
+    quiet: bool,
 }
 
 fn is_prefix_valid(prefix: &str) -> bool {
@@ -40,18 +48,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     validate_prefix(&prefix)?;
 
-    println!("🔍 Searching for Ed25519 key with prefix: {}", prefix);
-    println!("🖥️  Using {} CPU cores", num_cpus::get());
+    let quiet = args.quiet || args.json;
+
+    if !quiet {
+        println!("🔍 Searching for Ed25519 key with prefix: {}", prefix);
+        println!("🖥️  Using {} CPU cores", num_cpus::get());
+    }
 
     let estimated_attempts = calculate_estimated_attempts(prefix.len());
-    println!(
-        "📊 Estimated attempts needed: ~{}",
-        format_number(estimated_attempts)
-    );
-    println!("⏱️  Starting search...\n");
+    
+    if !quiet {
+        println!(
+            "📊 Estimated attempts needed: ~{}",
+            format_number(estimated_attempts)
+        );
+        println!("⏱️  Starting search...\n");
+    }
 
     let (found, attempts) = initialize_shared_state();
-    let pb = setup_progress_bar(estimated_attempts);
+    
+    // Only set up progress bar if not in quiet mode
+    let pb = if !quiet {
+        Some(setup_progress_bar(estimated_attempts))
+    } else {
+        None
+    };
 
     let start_time = Instant::now();
     let monitor_handle = spawn_progress_monitor(
@@ -65,7 +86,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     found.store(true, Ordering::Relaxed);
     monitor_handle.join().unwrap();
-    pb.finish();
+    
+    if let Some(bar) = pb {
+        bar.finish();
+    }
 
     let elapsed = start_time.elapsed();
     let total_attempts = attempts.load(Ordering::Relaxed);
@@ -73,7 +97,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     match result {
         Some(key_result) => handle_success(key_result, &args, &prefix, total_attempts, elapsed),
         None => {
-            println!("\n❌ Search was interrupted");
+            if !quiet {
+                println!("\n❌ Search was interrupted");
+            }
             Err("Search interrupted".into())
         }
     }
@@ -122,7 +148,7 @@ fn setup_progress_bar(len: u64) -> ProgressBar {
 }
 
 fn spawn_progress_monitor(
-    pb: ProgressBar,
+    pb: Option<ProgressBar>,
     attempts: Arc<AtomicU64>,
     found: Arc<AtomicBool>,
     initial_estimate: u64,
@@ -135,25 +161,27 @@ fn spawn_progress_monitor(
         while !found.load(Ordering::Relaxed) {
             let current = attempts.load(Ordering::Relaxed);
 
-            // Update total if we exceed initial estimate
-            if current > current_total {
-                current_total = current + (current / 10); // Add 10% buffer
-                pb.set_length(current_total);
-            }
-
-            pb.set_position(current);
-
-            // Recalculate ETA every second based on actual rate
-            if last_update_time.elapsed() >= Duration::from_secs(1) {
-                let rate =
-                    (current - last_attempts) as f64 / last_update_time.elapsed().as_secs_f64();
-                if rate > 0.0 && current < current_total {
-                    let remaining = current_total - current;
-                    let eta_secs = (remaining as f64 / rate) as u64;
-                    pb.set_message(format!("~{}s remaining", eta_secs));
+            if let Some(ref bar) = pb {
+                // Update total if we exceed initial estimate
+                if current > current_total {
+                    current_total = current + (current / 10); // Add 10% buffer
+                    bar.set_length(current_total);
                 }
-                last_attempts = current;
-                last_update_time = Instant::now();
+
+                bar.set_position(current);
+
+                // Recalculate ETA every second based on actual rate
+                if last_update_time.elapsed() >= Duration::from_secs(1) {
+                    let rate =
+                        (current - last_attempts) as f64 / last_update_time.elapsed().as_secs_f64();
+                    if rate > 0.0 && current < current_total {
+                        let remaining = current_total - current;
+                        let eta_secs = (remaining as f64 / rate) as u64;
+                        bar.set_message(format!("~{}s remaining", eta_secs));
+                    }
+                    last_attempts = current;
+                    last_update_time = Instant::now();
+                }
             }
 
             std::thread::sleep(Duration::from_millis(100));
@@ -162,8 +190,7 @@ fn spawn_progress_monitor(
 }
 
 struct KeyResult {
-    #[allow(dead_code)]
-    // Used in original logic logic but maybe not all fields needed for output directly, keeping for consistency
+    #[allow(dead_code)] // Used in original logic logic but maybe not all fields needed for output directly, keeping for consistency
     signing_key: SigningKey,
     #[allow(dead_code)]
     verifying_key: VerifyingKey,
@@ -260,46 +287,56 @@ fn generate_ed25519_key(rng: &mut OsRng) -> (SigningKey, VerifyingKey, String, [
 fn handle_success(
     result: KeyResult,
     args: &Args,
-    prefix: &str,
+    _prefix: &str,
     total_attempts: u64,
     elapsed: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let private_key_hex = hex::encode(result.rfc8032_private_key);
 
-    println!("\n✓ Key Generated Successfully!");
-    println!("Public Key:");
-    println!("{}", result.public_key_hex.to_uppercase());
-    println!("Private Key:");
-    println!("{}", private_key_hex.to_uppercase());
-    println!("Validation Status:");
-    println!(
-        "✓ RFC 8032 Ed25519 compliant - Proper SHA-512 expansion, scalar clamping, and key consistency verified"
-    );
-    println!("{}", format_number(total_attempts));
-    println!("Attempts");
-    println!("{:.1}s", elapsed.as_secs_f64());
-    println!("Time");
-    println!(
-        "{}",
-        format_number((total_attempts as f64 / elapsed.as_secs_f64()) as u64)
-    );
-    println!("Keys/sec");
+    if args.json {
+        let keypair = MeshCoreKeypair {
+            public_key: result.public_key_hex.to_uppercase(),
+            private_key: private_key_hex.to_uppercase(),
+        };
+        let json_output = serde_json::to_string_pretty(&keypair)?;
+        println!("{}", json_output);
+    } else if !args.quiet {
+        println!("\n✓ Key Generated Successfully!");
+        println!("Public Key:");
+        println!("{}", result.public_key_hex.to_uppercase());
+        println!("Private Key:");
+        println!("{}", private_key_hex.to_uppercase());
+        println!("Validation Status:");
+        println!(
+            "✓ RFC 8032 Ed25519 compliant - Proper SHA-512 expansion, scalar clamping, and key consistency verified"
+        );
+        println!("{}", format_number(total_attempts));
+        println!("Attempts");
+        println!("{:.1}s", elapsed.as_secs_f64());
+        println!("Time");
+        println!(
+            "{}",
+            format_number((total_attempts as f64 / elapsed.as_secs_f64()) as u64)
+        );
+        println!("Keys/sec");
+    }
 
-    // Save to file
-    let output_filename = args
-        .output
-        .clone()
-        .unwrap_or_else(|| format!("meshcore_{}.json", prefix));
-
-    match save_keypair_json(
-        &output_filename,
-        &result.public_key_hex.to_uppercase(),
-        &private_key_hex.to_uppercase(),
-    ) {
-        Ok(_) => println!("\n💾 Key pair saved to: {}", output_filename),
-        Err(e) => {
-            eprintln!("\n⚠️  Failed to save key pair: {}", e);
-            return Err("Failed to save key pair".into());
+    // Save to file only if output arg is present
+    if let Some(output_filename) = &args.output {
+        match save_keypair_json(
+            output_filename,
+            &result.public_key_hex.to_uppercase(),
+            &private_key_hex.to_uppercase(),
+        ) {
+            Ok(_) => {
+                if !args.quiet && !args.json {
+                    println!("\n💾 Key pair saved to: {}", output_filename)
+                }
+            }
+            Err(e) => {
+                eprintln!("\n⚠️  Failed to save key pair: {}", e);
+                return Err("Failed to save key pair".into());
+            }
         }
     }
     Ok(())
@@ -343,4 +380,3 @@ mod num_cpus {
             .unwrap_or(1)
     }
 }
-
