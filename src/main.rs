@@ -1,4 +1,5 @@
 use clap::Parser;
+use colored::*;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use indicatif::{ProgressBar, ProgressStyle};
 use rand::rngs::OsRng;
@@ -51,18 +52,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let quiet = args.quiet || args.json;
 
     if !quiet {
-        println!("🔍 Searching for Ed25519 key with prefix: {}", prefix);
-        println!("🖥️  Using {} CPU cores", num_cpus::get());
+        print_banner();
+        println!(
+            "{} {}",
+            "🔍 Searching for Ed25519 key with prefix:".bold().blue(),
+            prefix.yellow().bold()
+        );
+        println!(
+            "{} {}",
+            "🖥️  Using CPU cores:".bold().blue(),
+            num_cpus::get().to_string().yellow()
+        );
     }
 
     let estimated_attempts = calculate_estimated_attempts(prefix.len());
     
     if !quiet {
         println!(
-            "📊 Estimated attempts needed: ~{}",
-            format_number(estimated_attempts)
+            "{} {}",
+            "📊 Estimated attempts needed:".bold().blue(),
+            format!("~{}", format_number(estimated_attempts)).yellow()
         );
-        println!("⏱️  Starting search...\n");
+        println!("{}", "⏱️  Starting search...\n".bold().green());
     }
 
     let (found, attempts) = initialize_shared_state();
@@ -88,7 +99,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     monitor_handle.join().unwrap();
     
     if let Some(bar) = pb {
-        bar.finish();
+        bar.finish_and_clear();
     }
 
     let elapsed = start_time.elapsed();
@@ -98,7 +109,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(key_result) => handle_success(key_result, &args, &prefix, total_attempts, elapsed),
         None => {
             if !quiet {
-                println!("\n❌ Search was interrupted");
+                println!("\n{}", "❌ Search was interrupted".red().bold());
             }
             Err("Search interrupted".into())
         }
@@ -106,6 +117,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 // --- Helper Functions ---
+
+fn print_banner() {
+    println!("{}", "=============================================".bright_purple());
+    println!("{}", "       Vanity Ed25519 Key Generator          ".bright_purple().bold());
+    println!("{}\n", "=============================================".bright_purple());
+}
 
 fn normalize_prefix(args: &Args) -> String {
     if args.case_sensitive {
@@ -117,7 +134,7 @@ fn normalize_prefix(args: &Args) -> String {
 
 fn validate_prefix(prefix: &str) -> Result<(), Box<dyn std::error::Error>> {
     if !is_prefix_valid(prefix) {
-        println!("❌ Prefix must contain only hexadecimal characters (0-9, a-f)");
+        println!("{}", "❌ Prefix must contain only hexadecimal characters (0-9, a-f)".red().bold());
         return Err(format!("Invalid prefix: {}", prefix).into());
     }
     Ok(())
@@ -139,7 +156,7 @@ fn setup_progress_bar(len: u64) -> ProgressBar {
     pb.set_style(
         ProgressStyle::default_bar()
             .template(
-                "[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) | {per_sec} | ETA: {eta}"
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) | {per_sec} | ETA: {eta}"
             )
             .unwrap()
             .progress_chars("#>-"),
@@ -301,24 +318,35 @@ fn handle_success(
         let json_output = serde_json::to_string_pretty(&keypair)?;
         println!("{}", json_output);
     } else if !args.quiet {
-        println!("\n✓ Key Generated Successfully!");
-        println!("Public Key:");
-        println!("{}", result.public_key_hex.to_uppercase());
-        println!("Private Key:");
-        println!("{}", private_key_hex.to_uppercase());
-        println!("Validation Status:");
-        println!(
-            "✓ RFC 8032 Ed25519 compliant - Proper SHA-512 expansion, scalar clamping, and key consistency verified"
-        );
-        println!("{}", format_number(total_attempts));
-        println!("Attempts");
-        println!("{:.1}s", elapsed.as_secs_f64());
-        println!("Time");
+        println!("\n{}", "✓ Key Generated Successfully!".bold().green());
+        println!("{}", "=============================================".bright_black());
+        
+        println!("{}:", "Public Key".cyan().bold());
+        println!("{}", result.public_key_hex.to_uppercase().white());
+        
+        println!("\n{}:", "Private Key".cyan().bold());
+        println!("{}", private_key_hex.to_uppercase().white());
+        
+        println!("\n{}", "Validation Status:".yellow().bold());
         println!(
             "{}",
-            format_number((total_attempts as f64 / elapsed.as_secs_f64()) as u64)
+            "✓ RFC 8032 Ed25519 compliant - Proper SHA-512 expansion, scalar clamping, and key consistency verified".green()
         );
-        println!("Keys/sec");
+        println!("{}", "=============================================".bright_black());
+        
+        let attempts_str = format_number(total_attempts);
+        let time_str = format!("{:.1}s", elapsed.as_secs_f64());
+        let keys_per_sec = format_number((total_attempts as f64 / elapsed.as_secs_f64()) as u64);
+
+        println!(
+            "{}: {} {}: {} {}: {}",
+            "Attempts".bold(),
+            attempts_str.yellow(),
+            "Time".bold(),
+            time_str.yellow(),
+            "Keys/sec".bold(),
+            keys_per_sec.green()
+        );
     }
 
     // Save to file only if output arg is present
@@ -330,11 +358,11 @@ fn handle_success(
         ) {
             Ok(_) => {
                 if !args.quiet && !args.json {
-                    println!("\n💾 Key pair saved to: {}", output_filename)
+                    println!("\n{} {}", "💾 Key pair saved to:".bold(), output_filename.green())
                 }
             }
             Err(e) => {
-                eprintln!("\n⚠️  Failed to save key pair: {}", e);
+                eprintln!("\n{} {}", "⚠️  Failed to save key pair:".red().bold(), e);
                 return Err("Failed to save key pair".into());
             }
         }
