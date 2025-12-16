@@ -2,15 +2,15 @@ use clap::Parser;
 use colored::*;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use indicatif::{ProgressBar, ProgressStyle};
-use rand::RngCore;
 use rand::rngs::OsRng;
+use rand::RngCore;
 use rayon::prelude::*;
 use serde::Serialize;
 use sha2::{Digest, Sha512};
 use std::fs;
 use std::io::Error;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -99,7 +99,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     monitor_handle.join().unwrap();
 
     if let Some(bar) = pb {
-        bar.finish_and_clear();
+        // Kept visible as requested
+        bar.finish();
     }
 
     let elapsed = start_time.elapsed();
@@ -329,44 +330,6 @@ fn handle_success(
         println!("{}", json_output);
     } else {
         // Human readable output
-        // We print the decorative box to STDOUT as it is the "result"
-        // But we print stats to STDERR?
-        // Let's print the Keys to STDOUT.
-        // Let's print the Banner/Stats to STDERR?
-        // Actually, to keep it "Beautiful" and consistent, if we are in human mode,
-        // we usually want it all together. But if the user redirects stdout, they get the keys.
-        // Let's split it: Keys to stdout, Stats to stderr.
-        // But the box wraps them.
-
-        if !args.quiet {
-            eprintln!("\n{}", "✓ Key Generated Successfully!".bold().green());
-            // Stats to stderr
-            eprintln!(
-                "{}",
-                "=============================================".bright_black()
-            );
-        }
-
-        // Keys to stdout (so they can be captured)
-        // Note: If we pipe this, we lose the colors usually, but if we just run it, we see them.
-        // We will print the keys to stdout.
-        if !args.quiet {
-            // Label
-            // If we print labels to stderr, and keys to stdout, they might desynchronize visually.
-            // But let's assume standard usage.
-            // "Public Key:"
-        }
-
-        // Actually, the user asked for "default output (progressbar etc) is output to stderr".
-        // "so that we can still have that output together with --json output which goes to stdout".
-        // This implies specifically for JSON mode.
-        // For non-JSON mode, usually everything goes to stdout or everything to stderr except the "data".
-        // Let's stick to: ALL Logs/Progress -> Stderr.
-        // Final Result -> Stdout.
-
-        // For the "Beautiful Box", it is the result. So it goes to Stdout.
-        // The stats (Attempts/Time) are metadata.
-
         println!(
             "{}",
             "=============================================".bright_black()
@@ -380,30 +343,33 @@ fn handle_success(
             "{}",
             "=============================================".bright_black()
         );
+    }
 
-        if !args.quiet {
-            // Validation and Stats to stderr
-            eprintln!("\n{}", "Validation Status:".yellow().bold());
-            eprintln!(
-                "{}",
-                "✓ RFC 8032 Ed25519 compliant - Proper SHA-512 expansion, scalar clamping, and key consistency verified".green()
-            );
+    // Print Stats and Validation to stderr, unless quiet
+    if !args.quiet {
+        eprintln!("\n{}", "✓ Key Generated Successfully!".bold().green());
+        // Removed the extra horizontal line here to avoid double lines in human output
+        
+        eprintln!("\n{}", "Validation Status:".yellow().bold());
+        eprintln!(
+            "{}",
+            "✓ RFC 8032 Ed25519 compliant - Proper SHA-512 expansion, scalar clamping, and key consistency verified".green()
+        );
 
-            let attempts_str = format_number(total_attempts);
-            let time_str = format!("{:.1}s", elapsed.as_secs_f64());
-            let keys_per_sec =
-                format_number((total_attempts as f64 / elapsed.as_secs_f64()) as u64);
+        let attempts_str = format_number(total_attempts);
+        let time_str = format!("{:.1}s", elapsed.as_secs_f64());
+        let keys_per_sec =
+            format_number((total_attempts as f64 / elapsed.as_secs_f64()) as u64);
 
-            eprintln!(
-                "{} {} {} {} {} {}",
-                "Attempts".bold(),
-                attempts_str.yellow(),
-                "Time".bold(),
-                time_str.yellow(),
-                "Keys/sec".bold(),
-                keys_per_sec.green()
-            );
-        }
+        eprintln!(
+            "{} {} {} {} {} {}",
+            "Attempts".bold(),
+            attempts_str.yellow(),
+            "Time".bold(),
+            time_str.yellow(),
+            "Keys/sec".bold(),
+            keys_per_sec.green()
+        );
     }
 
     // Save to file only if output arg is present
