@@ -21,10 +21,6 @@ struct Args {
     #[arg(short, long)]
     prefix: String,
 
-    /// Case sensitive search (Note: Ed25519 hex is typically lowercase, this might restrict results)
-    #[arg(short = 's', long, default_value_t = false)]
-    case_sensitive: bool,
-
     /// Output file to save the key pair (optional)
     #[arg(short, long)]
     output: Option<String>,
@@ -45,21 +41,21 @@ fn is_prefix_valid(prefix: &str) -> bool {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    // We keep the prefix normalization for display/logic, but we'll use nibbles for searching
-    let prefix = normalize_prefix(&args);
+    let prefix = args.prefix.clone();
 
     validate_prefix(&prefix)?;
 
-    let quiet = args.quiet || args.json;
+    // Quiet mode only suppresses logs (stderr), NOT the result (stdout)
+    let quiet = args.quiet;
 
     if !quiet {
         print_banner();
-        println!(
+        eprintln!(
             "{} {}",
             "🔍 Searching for Ed25519 key with prefix:".bold().blue(),
             prefix.yellow().bold()
         );
-        println!(
+        eprintln!(
             "{} {}",
             "🖥️  Using CPU cores:".bold().blue(),
             num_cpus::get().to_string().yellow()
@@ -69,16 +65,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let estimated_attempts = calculate_estimated_attempts(prefix.len());
 
     if !quiet {
-        println!(
+        eprintln!(
             "{} {}",
             "📊 Estimated attempts needed:".bold().blue(),
             format!("~{}", format_number(estimated_attempts)).yellow()
         );
-        println!("{}", "⏱️  Starting search...\n".bold().green());
+        eprintln!("{}", "⏱️  Starting search...\n".bold().green());
     }
 
     let (found, attempts) = initialize_shared_state();
-    
+
     // Prepare nibbles for fast comparison
     let target_nibbles = hex_string_to_nibbles(&prefix);
 
@@ -113,7 +109,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(key_result) => handle_success(key_result, &args, &prefix, total_attempts, elapsed),
         None => {
             if !quiet {
-                println!("\n{}", "❌ Search was interrupted".red().bold());
+                eprintln!("\n{}", "❌ Search was interrupted".red().bold());
             }
             Err("Search interrupted".into())
         }
@@ -123,22 +119,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 // --- Helper Functions ---
 
 fn print_banner() {
-    println!("{}", "=============================================".bright_purple());
-    println!("{}", "       Vanity Ed25519 Key Generator          ".bright_purple().bold());
-    println!("{}\n", "=============================================".bright_purple());
-}
-
-fn normalize_prefix(args: &Args) -> String {
-    if args.case_sensitive {
-        args.prefix.clone()
-    } else {
-        args.prefix.to_lowercase()
-    }
+    eprintln!("{}", "=============================================".bright_purple());
+    eprintln!("{}", "       Vanity Ed25519 Key Generator          ".bright_purple().bold());
+    eprintln!("{}\n", "=============================================".bright_purple());
 }
 
 fn validate_prefix(prefix: &str) -> Result<(), Box<dyn std::error::Error>> {
     if !is_prefix_valid(prefix) {
-        println!("{}", "❌ Prefix must contain only hexadecimal characters (0-9, a-f)".red().bold());
+        eprintln!("{}", "❌ Prefix must contain only hexadecimal characters (0-9, a-f)".red().bold());
         return Err(format!("Invalid prefix: {}", prefix).into());
     }
     Ok(())
@@ -165,6 +153,7 @@ fn setup_progress_bar(len: u64) -> ProgressBar {
             .unwrap()
             .progress_chars("#>-"),
     );
+    // indicatif defaults to stderr, which is what we want
     pb
 }
 
@@ -330,37 +319,75 @@ fn handle_success(
             private_key: private_key_hex.to_uppercase(),
         };
         let json_output = serde_json::to_string_pretty(&keypair)?;
+        // JSON output always to stdout
         println!("{}", json_output);
-    } else if !args.quiet {
-        println!("\n{}", "✓ Key Generated Successfully!".bold().green());
-        println!("{}", "=============================================".bright_black());
+    } else {
+        // Human readable output
+        // We print the decorative box to STDOUT as it is the "result"
+        // But we print stats to STDERR?
+        // Let's print the Keys to STDOUT.
+        // Let's print the Banner/Stats to STDERR?
+        // Actually, to keep it "Beautiful" and consistent, if we are in human mode,
+        // we usually want it all together. But if the user redirects stdout, they get the keys.
+        // Let's split it: Keys to stdout, Stats to stderr.
+        // But the box wraps them.
         
+        if !args.quiet {
+            eprintln!("\n{}", "✓ Key Generated Successfully!".bold().green());
+            // Stats to stderr
+            eprintln!("{}", "=============================================".bright_black());
+        }
+
+        // Keys to stdout (so they can be captured)
+        // Note: If we pipe this, we lose the colors usually, but if we just run it, we see them.
+        // We will print the keys to stdout.
+        if !args.quiet {
+            // Label
+             // If we print labels to stderr, and keys to stdout, they might desynchronize visually.
+             // But let's assume standard usage.
+             // "Public Key:"
+        }
+        
+        // Actually, the user asked for "default output (progressbar etc) is output to stderr".
+        // "so that we can still have that output together with --json output which goes to stdout".
+        // This implies specifically for JSON mode.
+        // For non-JSON mode, usually everything goes to stdout or everything to stderr except the "data".
+        // Let's stick to: ALL Logs/Progress -> Stderr.
+        // Final Result -> Stdout.
+        
+        // For the "Beautiful Box", it is the result. So it goes to Stdout.
+        // The stats (Attempts/Time) are metadata. 
+        
+        println!("{}", "=============================================".bright_black());
         println!("{}:", "Public Key".cyan().bold());
         println!("{}", result.public_key_hex.to_uppercase().white());
         
         println!("\n{}:", "Private Key".cyan().bold());
         println!("{}", private_key_hex.to_uppercase().white());
-        
-        println!("\n{}", "Validation Status:".yellow().bold());
-        println!(
-            "{}",
-            "✓ RFC 8032 Ed25519 compliant - Proper SHA-512 expansion, scalar clamping, and key consistency verified".green()
-        );
         println!("{}", "=============================================".bright_black());
-        
-        let attempts_str = format_number(total_attempts);
-        let time_str = format!("{:.1}s", elapsed.as_secs_f64());
-        let keys_per_sec = format_number((total_attempts as f64 / elapsed.as_secs_f64()) as u64);
 
-        println!(
-            "{}: {} {}: {} {}: {}",
-            "Attempts".bold(),
-            attempts_str.yellow(),
-            "Time".bold(),
-            time_str.yellow(),
-            "Keys/sec".bold(),
-            keys_per_sec.green()
-        );
+        if !args.quiet {
+            // Validation and Stats to stderr
+            eprintln!("\n{}", "Validation Status:".yellow().bold());
+            eprintln!(
+                "{}",
+                "✓ RFC 8032 Ed25519 compliant - Proper SHA-512 expansion, scalar clamping, and key consistency verified".green()
+            );
+            
+            let attempts_str = format_number(total_attempts);
+            let time_str = format!("{:.1}s", elapsed.as_secs_f64());
+            let keys_per_sec = format_number((total_attempts as f64 / elapsed.as_secs_f64()) as u64);
+
+            eprintln!(
+                "{} {} {} {} {} {}",
+                "Attempts".bold(),
+                attempts_str.yellow(),
+                "Time".bold(),
+                time_str.yellow(),
+                "Keys/sec".bold(),
+                keys_per_sec.green()
+            );
+        }
     }
 
     // Save to file only if output arg is present
@@ -371,8 +398,8 @@ fn handle_success(
             &private_key_hex.to_uppercase(),
         ) {
             Ok(_) => {
-                if !args.quiet && !args.json {
-                    println!("\n{} {}", "💾 Key pair saved to:".bold(), output_filename.green())
+                if !args.quiet {
+                    eprintln!("\n{} {}", "💾 Key pair saved to:".bold(), output_filename.green())
                 }
             }
             Err(e) => {
