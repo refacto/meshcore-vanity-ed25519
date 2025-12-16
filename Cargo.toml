@@ -10,7 +10,7 @@ rayon = "1.8"
 clap = { version = "4.4", features = ["derive"] }
 hex = "0.4"
 ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
-sha2 = { version = "0.10", features = ["asm"] }
+sha2 = { version = "0.10" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 colored = "3.0.0"
@@ -21,3 +21,4 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
