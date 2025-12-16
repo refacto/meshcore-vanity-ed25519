@@ -11,7 +11,7 @@ Designed to produce keys compatible with **MeshCore** requirements (64-byte priv
 | [Web Generator](https://gessaman.com/mc-keygen/) | ~8,000 keys/sec |
 | **vanity_ed25519 (This tool)** | **~650,000+ keys/sec** |
 
-*Benchmarks on a standard laptop (32-core). Performance scales linearly with CPU cores.*
+*Benchmarks on my laptop (13th Gen Intel(R) Core(TM) i9-13950HX, 32 CPU threads, 30GiB RAM, Linux, rustc 1.92.0). Performance scales linearly with CPU cores.*
 
 This tool utilizes:
 - **Native CPU Instructions:** Auto-detects and uses AVX2/SIMD via `.cargo/config.toml`.
