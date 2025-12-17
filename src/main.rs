@@ -197,7 +197,7 @@ fn spawn_progress_monitor(
             if let Some(ref bar) = pb {
                 // Update total if we exceed initial estimate
                 if current > current_total {
-                    current_total = current + (current / 10); // Add 10% buffer
+                    current_total = current; // Add 10% buffer
                     bar.set_length(current_total);
                 }
 
